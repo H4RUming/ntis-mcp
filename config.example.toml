@@ -1,0 +1,18 @@
+# 설정 파일 예시. 이 파일을 config.toml 로 복사해 값을 채운다(config.toml 은 git 에 올라가지 않는다).
+#   cp config.example.toml config.toml && chmod 600 config.toml
+# 다른 위치의 파일을 쓰려면 환경변수 RND_CONFIG 또는 각 서버의 --config 로 경로를 준다.
+
+[ntis]
+# NTIS OpenAPI 승인키 (ntis.go.kr → 데이터활용 → OpenAPI 에서 발급).
+# 비워 두면 NTIS 서버는 뜨지만 모든 도구가 "키가 등록되지 않았다"고 답한다.
+# 환경변수 NTIS_API_KEY 가 있으면 그 값이 우선한다.
+api_key = ""
+
+# true 이면 NTIS 가 대외 서비스(웹·모바일)에 허용한 항목만 돌려준다.
+# 그 밖의 항목(연구목표·기대효과·참여연구원·분류코드 등)은 NTIS 과제 상세 페이지 링크로 대신한다.
+external_use = true
+
+# 요청 사이 최소 간격(초), 제한 시간(초), 같은 요청 결과를 다시 쓰는 시간(초)
+delay = 0.3
+timeout = 20
+cache_ttl = 600
