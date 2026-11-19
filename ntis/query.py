@@ -15,7 +15,7 @@ import appconfig
 from .client import CODE_KINDS, SERVICES, Client, NtisError, Page
 
 PROJECT_URL = 'https://www.ntis.go.kr/project/pjtInfo.do?pjtId={}'
-MAX_LIMIT = 50
+MAX_LIMIT = 100             # NTIS 가 한 번에 주는 최대 건수
 SUMMARY_CHARS = 250
 _EXTERNAL_NOTE = ('NTIS 가 대외 서비스에 허용한 항목만 담았습니다. 연구목표·기대효과·참여연구원·분류 등은 url 의 '
                   'NTIS 과제 상세 페이지(로그인 필요)에서 확인합니다.')
@@ -48,6 +48,17 @@ def _short(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + '…'
 
 
+def _won(amount: int | None) -> str:
+    """원 단위 금액을 읽기 쉬운 글로: 1000000000 → '10억 원'. 자릿수가 긴 숫자를 받는 쪽이 잘못 읽지 않게 함께 싣는다."""
+    if amount is None:
+        return ''
+    if abs(amount) >= 100_000_000:
+        return f'{amount / 100_000_000:,.2f}'.rstrip('0').rstrip('.') + '억 원'
+    if abs(amount) >= 10_000:
+        return f'{amount // 10_000:,}만 원'
+    return f'{amount:,}원'
+
+
 def _drop_empty(record: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in record.items() if value not in ('', None, [], {})}
 
@@ -67,7 +78,9 @@ def project_record(hit: dict[str, Any], external_use: bool) -> dict[str, Any]:
         'total_period': _period(hit, 'TotalStart', 'TotalEnd'),
         'year_period': _period(hit, 'Start', 'End'),
         'government_funds': _number(hit.get('GovernmentFunds')),
+        'government_funds_text': _won(_number(hit.get('GovernmentFunds'))),
         'total_funds': _number(hit.get('TotalFunds')),
+        'total_funds_text': _won(_number(hit.get('TotalFunds'))),
         'summary': _short(abstract, SUMMARY_CHARS),
         'keywords': _text(hit, 'Keyword', 'Korean'),
         'keywords_en': _text(hit, 'Keyword', 'English'),
@@ -156,8 +169,46 @@ def term_record(hit: dict[str, Any]) -> dict[str, Any]:
 _RECORDS = {'paper': paper_record, 'patent': patent_record, 'report': report_record, 'term': term_record}
 
 
+def _alternatives(text: str) -> list[str]:
+    """`|` 로 이은 말들(큰따옴표 안의 `|` 는 나누지 않는다)."""
+    pieces, current, quoted = [], '', False
+    for char in str(text or ''):
+        quoted = quoted != (char == '"')
+        if char == '|' and not quoted:
+            pieces.append(current)
+            current = ''
+        else:
+            current += char
+    return [' '.join(piece.split()) for piece in pieces + [current] if piece.strip()]
+
+
+def _group(text: str) -> str:
+    """검색어 한 칸을 NTIS 식으로. `|` 가 없으면 그대로(띄어 쓴 낱말은 모두 포함), 있으면 이은 말 하나하나를 한 구절로 본다.
+
+    NTIS 는 `|` 를 띄어쓰기보다 먼저 묶어서 `양자컴퓨팅|양자 알고리즘|큐비트` 가 (양자컴퓨팅 또는 양자) 그리고 (알고리즘 또는 큐비트)가
+    된다. 쓰는 쪽의 뜻은 "셋 중 하나"이므로, 띄어 쓴 말은 그 구절과 붙여 쓴 꼴 둘로 바꿔 넣는다.
+    """
+    alternatives = _alternatives(text)
+    if len(alternatives) <= 1:
+        return alternatives[0] if alternatives else ''
+    out = []
+    for alternative in alternatives:
+        if ' ' in alternative and '"' not in alternative and not alternative.startswith(('!', '(')):
+            out += [f'"{alternative}"', alternative.replace(' ', '')]
+        else:
+            out.append(alternative)
+    return '|'.join(dict.fromkeys(out))
+
+
+def expression(query: str, and_text: str = '') -> str:
+    """query_text 와 and_text 를 NTIS 검색식 하나로: 둘 다 있으면 양쪽을 모두 채우는 자료만 찾는다."""
+    first, second = _group(query), _group(and_text)
+    return f'({first}) ({second})' if first and second else first or second
+
+
 def _page(client: Client, service: str, query: str, search_in: str, conditions: dict[str, str], year_from: int | None,
-          year_to: int | None, sort: str, limit: int, offset: int) -> tuple[Page, int]:
+          year_to: int | None, sort: str, limit: int, offset: int, and_text: str = '') -> tuple[Page, int]:
+    query = expression(query, and_text)
     limit = min(max(1, int(limit)), MAX_LIMIT)
     offset = max(0, int(offset))
     page = client.search(service, query, search_field=search_in, conditions=conditions, year_from=year_from or None,
@@ -174,12 +225,12 @@ def _listing(page: Page, offset: int, items: list[dict[str, Any]]) -> dict[str, 
 
 def search_projects(client: Client, query: str = '', search_in: str = '', year_from: int = 0, year_to: int = 0,
                     ministry: str = '', organization: str = '', program: str = '', manager: str = '', sort: str = '',
-                    limit: int = 10, offset: int = 0) -> dict[str, Any]:
+                    limit: int = 10, offset: int = 0, and_text: str = '') -> dict[str, Any]:
     conditions = {'ministry': ministry, 'organization': organization, 'program': program, 'manager': manager}
-    page, offset = _page(client, 'project', query, search_in, conditions, year_from, year_to, sort, limit, offset)
+    page, offset = _page(client, 'project', query, search_in, conditions, year_from, year_to, sort, limit, offset, and_text)
     external = client.settings.external_use
     result = _listing(page, offset, [project_record(hit, external) for hit in page.hits])
-    result['note'] = ('과제는 연도마다 한 건씩 등록됩니다(다년도 과제는 기준년도별로 따로 나옵니다). 연구비는 그 기준년도 한 해의 금액이며 NTIS 가 준 숫자 그대로입니다.'
+    result['note'] = ('과제는 연도마다 한 건씩 등록됩니다(다년도 과제는 기준년도별로 따로 나옵니다). 연구비는 그 기준년도 한 해의 금액(원)이며 NTIS 가 준 숫자 그대로입니다. 답에는 …_text 의 글을 그대로 씁니다.'
                       + (' ' + _EXTERNAL_NOTE if external else ''))
     return result
 
@@ -200,25 +251,26 @@ def get_project(client: Client, project_number: str) -> dict[str, Any]:
 
 
 def search_results(client: Client, kind: str, query: str = '', search_in: str = '', year_from: int = 0, year_to: int = 0,
-                   project_number: str = '', sort: str = '', limit: int = 10, offset: int = 0) -> dict[str, Any]:
+                   project_number: str = '', sort: str = '', limit: int = 10, offset: int = 0, and_text: str = '') -> dict[str, Any]:
     if kind not in ('paper', 'patent'):
         raise NtisError('input', 'kind 는 paper(논문) 또는 patent(특허)여야 합니다')
-    page, offset = _page(client, kind, query, search_in, {'project_number': project_number}, year_from, year_to, sort, limit, offset)
+    page, offset = _page(client, kind, query, search_in, {'project_number': project_number}, year_from, year_to, sort, limit, offset, and_text)
     return _listing(page, offset, [_RECORDS[kind](hit) for hit in page.hits])
 
 
 def search_reports(client: Client, query: str = '', search_in: str = '', year_from: int = 0, year_to: int = 0,
-                   publisher: str = '', sort: str = '', limit: int = 10, offset: int = 0) -> dict[str, Any]:
-    page, offset = _page(client, 'report', query, search_in, {'publisher': publisher}, year_from, year_to, sort, limit, offset)
+                   publisher: str = '', sort: str = '', limit: int = 10, offset: int = 0, and_text: str = '') -> dict[str, Any]:
+    page, offset = _page(client, 'report', query, search_in, {'publisher': publisher}, year_from, year_to, sort, limit, offset, and_text)
     result = _listing(page, offset, [report_record(hit) for hit in page.hits])
     result['note'] = '보고서 본문은 주지 않습니다. 제목·초록·목차 같은 메타정보이며 원문은 url 에서 확인합니다.'
     return result
 
 
 def count(client: Client, service: str, group_by: str, query: str = '', search_in: str = '', year_from: int = 0,
-          year_to: int = 0, top: int = 20, **conditions: str) -> dict[str, Any]:
+          year_to: int = 0, top: int = 20, and_text: str = '', **conditions: str) -> dict[str, Any]:
     """검색 결과 전체를 기준 하나로 센다(NTIS 의 NAVIGATION). 목록을 넘기며 세지 않는다."""
     spec = SERVICES[service]
+    query = expression(query, and_text)
     if group_by not in spec.facets:
         raise NtisError('input', f'{spec.label} 집계 기준은 {", ".join(spec.facets)} 중 하나여야 합니다: {group_by}')
     top = min(max(1, int(top)), 100)

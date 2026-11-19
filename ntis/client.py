@@ -317,7 +317,7 @@ class Client:
             if wait > 0:
                 time.sleep(wait)
             try:
-                body = self._fetch(url, data, settings.timeout)
+                body = _within(settings.timeout * 2 + 5, self._fetch, url, data, settings.timeout)
                 parsed = parser(body)
             except NtisError as exc:
                 # NTIS 는 거절한 키를 오류 문구에 그대로 실어 보낸다 — 밖으로 내보내기 전에 가린다
@@ -334,6 +334,27 @@ class Client:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[cache_key] = (now, body)
         return parsed
+
+
+def _within(seconds: float, function: Callable[..., bytes], *args: Any) -> bytes:
+    """function 을 seconds 안에 끝낸다. 소켓 시간 제한은 읽기 한 번마다만 걸려서, 이름 풀이가 멈추거나 답이 찔끔찔끔 오면
+    요청 하나가 끝없이 붙잡힌다(2026-11 실측: 키워드 수집 중 요청 하나가 5분 넘게 멈춤). 요청은 한 번에 하나씩 보내므로
+    하나가 멈추면 뒤의 요청이 모두 멈춘다. 그래서 전체 시간에 상한을 두고, 넘으면 그 요청은 버린다."""
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box['value'] = function(*args)
+        except BaseException as exc:
+            box['error'] = exc
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise NtisError('http', f'NTIS 가 {seconds:.0f}초 안에 답하지 않았습니다')
+    if 'error' in box:
+        raise box['error']
+    return box['value']
 
 
 def _http_fetch(url: str, data: bytes | None, timeout: float) -> bytes:

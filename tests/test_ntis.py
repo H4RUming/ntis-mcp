@@ -1,5 +1,6 @@
 """NTIS: 설정 파일의 승인키, 검색 조건 조립, 응답 해석, 대외 제공 항목 제한, 집계, 오류 처리, MCP 도구, 실키 점검 절차."""
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from urllib import parse
 from xml.sax.saxutils import escape
 
 import appconfig
-from ntis import check, client as ntis_client, query
+from ntis import check, client as ntis_client, query, terms
 from ntis.client import Client, NtisError, Settings
 
 try:
@@ -232,6 +233,19 @@ class SearchTests(unittest.TestCase):
         query.search_results(client, 'paper', '인공지능', year_from=2024, year_to=2024)
         self.assertEqual(fake.calls[-1][1]['addQuery'], 'DBT=PAP&PY=2024/SAME')   # 성과 검색은 DBT 가 필수
 
+    def test_alternatives_with_spaces_stay_one_phrase_and_and_text_narrows(self):
+        # NTIS 는 `|` 를 띄어쓰기보다 먼저 묶는다: 띄어 쓴 말은 구절(과 붙여 쓴 꼴)로 바꿔 보내야 "셋 중 하나"가 된다
+        self.assertEqual(query.expression('양자컴퓨팅|양자 알고리즘|"quantum computing"|큐비트'),
+                         '양자컴퓨팅|"양자 알고리즘"|양자알고리즘|"quantum computing"|큐비트')
+        self.assertEqual(query.expression('자율주행|자율차', '센서|라이다'), '(자율주행|자율차) (센서|라이다)')
+        self.assertEqual(query.expression('인공지능 반도체'), '인공지능 반도체')          # `|` 가 없으면 그대로(모두 포함)
+        self.assertEqual(query.expression('', '센서'), '센서')
+        client, fake = make()
+        query.search_projects(client, '자율주행|자율차', and_text='센서|라이다 센서', limit=1)
+        self.assertEqual(fake.calls[-1][1]['query'], '(자율주행|자율차) (센서|"라이다 센서"|라이다센서)')
+        query.count(client, 'project', 'year', '자율주행|자율차', and_text='센서')
+        self.assertEqual(fake.calls[-1][1]['query'], '(자율주행|자율차) (센서)')
+
     def test_external_use_keeps_only_permitted_fields(self):
         client, _ = make(external_use=True)
         result = query.search_projects(client, '인공지능', limit=2)
@@ -239,9 +253,13 @@ class SearchTests(unittest.TestCase):
         item = result['items'][0]
         self.assertEqual(set(item), {'project_number', 'title', 'title_en', 'year', 'ministry', 'program', 'organization',
                                      'manager', 'total_period', 'year_period', 'government_funds', 'total_funds', 'summary',
-                                     'keywords', 'keywords_en', 'url'})
+                                     'keywords', 'keywords_en', 'url',
+                                     'government_funds_text', 'total_funds_text'})      # 같은 금액을 읽기 쉽게 적은 글
         self.assertEqual(item['title'], '인공지능 반도체 설계 기술 개발')          # 강조 태그가 걷힌다
         self.assertEqual((item['year'], item['total_funds'], item['total_period']), (2025, 650000000, '2023-04-01 ~ 2027-12-31'))
+        self.assertEqual(item['total_funds_text'], '6.5억 원')
+        self.assertEqual([query._won(amount) for amount in (1000000000, 1172778000, 63000000, 5000, None)],
+                         ['10억 원', '11.73억 원', '6,300만 원', '5,000원', ''])
         self.assertLessEqual(len(item['summary']), query.SUMMARY_CHARS + 1)      # 연구내용은 250자 내외만
         self.assertEqual(item['url'], 'https://www.ntis.go.kr/project/pjtInfo.do?pjtId=' + item['project_number'])
         self.assertIn('허용한 항목', result['note'])
@@ -353,6 +371,17 @@ class SearchTests(unittest.TestCase):
                 ntis_client.parse_search(body)
             self.assertEqual(raised.exception.kind, kind)
 
+    def test_a_request_that_never_returns_is_given_up(self):
+        import threading
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with self.assertRaises(NtisError) as raised:
+            ntis_client._within(0.2, lambda: release.wait(30) and b'')        # 답이 오지 않는 요청
+        self.assertIn('안에 답하지 않았습니다', str(raised.exception))
+        self.assertEqual(ntis_client._within(5, lambda value: value, b'ok'), b'ok')
+        with self.assertRaises(NtisError):                                    # 요청 안에서 난 오류는 그대로 전한다
+            ntis_client._within(5, lambda: (_ for _ in ()).throw(NtisError('http', '실패')))
+
     def test_cache_reuses_answers_but_not_errors(self):
         client, fake = make(cache_ttl=600.0)
         query.search_projects(client, '인공지능')
@@ -383,18 +412,96 @@ class SearchTests(unittest.TestCase):
         self.assertIn('승인키가 없습니다', lines[0])
 
 
+# 가짜 임베딩: 같은 뜻끼리 같은 축을 보게 한 벡터(실제 모델 대신)
+TERM_AXES = {'인공지능': (1, 0, 0), 'AI': (0.98, 0.2, 0), 'Artificial Intelligence': (0.95, 0.3, 0), '의료 인공지능': (0.9, 0.4, 0),
+             '드론': (0, 1, 0), 'drone': (0, 0.97, 0.2), '무인기': (0, 0.96, 0.25), 'UAV': (0, 0.95, 0.3), '농업용 드론': (0, 0.9, 0.4),
+             '이차전지': (0, 0, 1)}
+
+
+class FakeTermSettings:
+    def __init__(self, embed_url, directory=None):
+        self.embed_url, self.model, self.dimensions, self.floor, self.directory = embed_url, '', 3, 0.5, directory
+
+
+def fake_embed(settings, texts, timeout=0):
+    import numpy
+    vectors = numpy.asarray([TERM_AXES.get(text, (0.5, 0.5, 0.5)) for text in texts], dtype='float32')
+    return vectors / numpy.linalg.norm(vectors, axis=1, keepdims=True)
+
+
+def fake_index():
+    directory = Path(tempfile.mkdtemp())
+    (directory / 'keywords.json').write_text(json.dumps({
+        '인공지능': ['인공지능', 'ko', 90], 'ai': ['AI', 'en', 80], 'artificial intelligence': ['Artificial Intelligence', 'en', 40],
+        '의료 인공지능': ['의료 인공지능', 'ko', 5], '드론': ['드론', 'ko', 50], 'drone': ['drone', 'en', 30], '무인기': ['무인기', 'ko', 9],
+        'uav': ['UAV', 'en', 7], '농업용 드론': ['농업용 드론', 'ko', 6], '이차전지': ['이차전지', 'ko', 20], '한번만': ['한번만', 'ko', 1],
+        'secret project': ['SECRET PROJECT', 'ko', 99]}, ensure_ascii=False), encoding='utf-8')
+    terms.embed = fake_embed
+    settings = FakeTermSettings('http://embed.test/v1/embeddings', directory)
+    terms.build(settings, log=lambda line: None)
+    return terms.Index(settings=settings)
+
+
+class TermTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, terms, 'embed', terms.embed)
+
+    def test_keywords_are_split_and_counted_and_harvest_resumes(self):
+        self.assertEqual(terms.split_keywords(' 인공지능 , (반도체); 12 ,A,양자  컴퓨팅,인공지능'), ['인공지능', '반도체', '양자 컴퓨팅'])
+        client, fake = make()
+        directory = Path(tempfile.mkdtemp())
+        self.assertEqual(terms.harvest(client, directory, [2025, 2024], max_requests=0, log=lambda line: None)['stopped'], 'max_requests')
+        first = terms.harvest(client, directory, [2025], log=lambda line: None)
+        self.assertEqual((first['requests'], first['stopped']), (1, ''))
+        again = terms.harvest(client, directory, [2025], log=lambda line: None)       # 이어서: 다 받은 연도는 다시 묻지 않는다
+        self.assertEqual(again['requests'], 0)
+        self.assertTrue(again['years']['2025']['done'])
+        self.assertEqual(again['records'], again['years']['2025']['total'])
+        counts = json.loads((directory / 'keywords.json').read_text(encoding='utf-8'))
+        self.assertEqual(counts['인공지능'][:2], ['인공지능', 'ko'])
+        self.assertEqual(counts['인공지능'][2], again['records'])
+        self.assertEqual(counts['ai'][1], 'en')
+
+    def test_similar_terms_skip_what_is_already_asked_and_survive_a_dead_embedder(self):
+        index = fake_index()
+        self.assertEqual(json.loads((index.settings.directory / 'index.json').read_text())['terms'], 10)     # 한 번만 쓰인 말과 내용 없는 말은 빠진다
+        # 가까운 순. 묻는 말 자신과, 그 말을 낱말로 품은 더 좁은 말('농업용 드론')은 내놓지 않는다
+        self.assertEqual([hit['term'] for hit in index.similar(['드론'])], ['drone', '무인기', 'UAV'])
+        self.assertEqual({hit['term'] for hit in index.similar(['드론', '무인기'])}, {'UAV', 'drone'})
+        self.assertEqual(index.similar(['드론'], limit=1)[0], {'term': 'drone', 'uses': 30, 'score': 0.979})
+        self.assertEqual(terms.hints(index, '인공지능|AI', '드론')['related_terms'],
+                         {'query_text': [{'term': 'Artificial Intelligence', 'uses': 40}],
+                          'and_text': [{'term': 'drone', 'uses': 30}, {'term': '무인기', 'uses': 9}, {'term': 'UAV', 'uses': 7}]})
+        self.assertEqual(terms.hints(index, '', ''), {})
+
+        def dead(settings, texts, timeout=0):
+            raise OSError('연결 실패')
+        terms.embed = dead
+        self.assertEqual(index.similar(['처음 묻는 말']), [])               # 임베딩 서버가 내려가 있으면 빈 결과
+        self.assertIn('임베딩 서버', index.problem)
+        self.assertEqual([hit['term'] for hit in index.similar(['드론'])], ['drone', '무인기', 'UAV'])      # 이미 물은 말은 기억해 둔 것으로 답한다
+
+
 class McpTests(unittest.TestCase):
     @unittest.skipIf(mcp_server is None, 'MCP SDK is not installed in this interpreter')
     def test_tools(self):
         async def scenario():
             client, _ = make()
-            server = mcp_server.create_server(client=client)
+            server = mcp_server.create_server(client=client, index=fake_index())
             tools = {tool.name: tool for tool in await server.list_tools()}
             self.assertEqual(set(tools), {'search_projects', 'count_projects', 'get_project', 'search_results', 'count_results',
-                                          'search_reports', 'lookup_term', 'lookup_class_code', 'ntis_status'})
+                                          'search_reports', 'lookup_term', 'lookup_class_code', 'ntis_status', 'related_terms'})
             self.assertTrue(all(tool.annotations.readOnlyHint for tool in tools.values()))
             _, found = await server.call_tool('search_projects', {'query_text': '인공지능', 'year_from': 2025, 'year_to': 2025})
             self.assertEqual((found['total'], found['items'][0]['year']), (3, 2025))
+            # 검색 결과에 가까운 말이 후보로 붙는다(검색어 자신과 그 말을 품은 더 좁은 말은 빠진다)
+            self.assertEqual([hit['term'] for hit in found['related_terms']['query_text']], ['AI', 'Artificial Intelligence'])
+            self.assertIn('후보', found['related_terms_note'])
+            _, related = await server.call_tool('related_terms', {'words': '드론|무인기'})
+            self.assertEqual({(hit['term'], hit['uses']) for hit in related['items']}, {('UAV', 7), ('drone', 30)})
+            quiet = mcp_server.create_server(client=client, index=terms.Index(settings=FakeTermSettings('')))
+            _, plain = await quiet.call_tool('search_projects', {'query_text': '인공지능'})
+            self.assertNotIn('related_terms', plain)                  # 색인을 쓰지 않으면 결과는 그대로다
             _, counted = await server.call_tool('count_projects', {'group_by': 'ministry', 'query_text': '인공지능', 'year_from': 2024})
             self.assertEqual((counted['total'], counted['rows'][0]['name']), (6, '과학기술정보통신부'))
             _, one = await server.call_tool('get_project', {'project_number': found['items'][0]['project_number']})

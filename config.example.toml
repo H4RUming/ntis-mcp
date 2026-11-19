@@ -16,3 +16,12 @@ external_use = true
 delay = 0.3
 timeout = 20
 cache_ttl = 600
+
+[terms]
+# 과제 키워드 색인: 검색어와 뜻이 가까운, 실제 과제에 쓰인 말을 찾아 검색 결과에 함께 준다(python -m ntis.terms 참고).
+# 임베딩은 이 주소(OpenAI 호환 /v1/embeddings)에 맡긴다. 비워 두면 색인을 쓰지 않는다.
+embed_url = ""              # 예: "http://127.0.0.1:8770/v1/embeddings"
+model = ""                  # 임베딩 서버가 모델 이름을 요구하면 적는다
+dimensions = 256            # 벡터 차원(모델이 앞쪽만 잘라 써도 되게 학습된 경우에만 줄인다)
+floor = 0.0                 # 이보다 덜 가까운 말은 추천하지 않는다. 값은 모델마다 다르다(EmbeddingGemma 는 0.9 쯤)
+# data = "data/terms"       # 키워드와 색인을 두는 폴더(설정 파일 기준)
